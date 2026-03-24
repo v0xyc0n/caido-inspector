@@ -1,0 +1,15 @@
+{
+  "name": "inspector",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "caido-dev build",
+    "watch": "caido-dev watch",
+    "dev": "caido-dev dev"
+  },
+  "devDependencies": {
+    "@caido-community/dev": "^0.1.6",
+    "@caido/sdk-frontend": "^0.55.3",
+    "typescript": "^5.9.3"
+  }
+}

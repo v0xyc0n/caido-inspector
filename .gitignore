@@ -1,0 +1,7 @@
+node_modules/
+dist/
+frontend/
+*.zip
+*.pem
+.DS_Store
+.claude/
