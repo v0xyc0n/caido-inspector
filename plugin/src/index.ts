@@ -10,48 +10,258 @@ type Entry = {
   savedAt: string;
 };
 
+/**
+ * Plugin storage is global to the plugin (one row per user+plugin in Caido's
+ * `plugins.db`), but request IDs are only meaningful inside the project that
+ * produced them. Entries are therefore bucketed per project id.
+ *
+ * `unassigned` holds entries written by versions that kept a single flat list.
+ * They are persisted back under the legacy `entries` key until a project is
+ * selected and they can be attributed to one.
+ */
+type Store = {
+  projects: Record<string, Entry[]>;
+  unassigned: Entry[];
+};
+
+const STORE_VERSION = 2;
+
+/** Giving up beats hanging forever when the API connection is down. */
+const QUERY_TIMEOUT_MS = 15_000;
+
+/** Frames to keep retrying an editor write while the page is being mounted. */
+const EDITOR_FLUSH_ATTEMPTS = 30;
+
 // ─── Storage ──────────────────────────────────────────────────────────────────
 
-function getEntries(sdk: Caido): Entry[] {
-  const data = sdk.storage.get() as { entries?: Entry[] } | null;
-  return data?.entries ?? [];
+function isEntry(value: unknown): value is Entry {
+  if (value === null || typeof value !== "object") return false;
+  const e = value as Partial<Entry>;
+  return (
+    typeof e.requestId === "string" &&
+    typeof e.host === "string" &&
+    typeof e.path === "string" &&
+    typeof e.savedAt === "string"
+  );
 }
 
-async function saveEntries(sdk: Caido, entries: Entry[]): Promise<void> {
-  await sdk.storage.set({ entries });
+function emptyStore(): Store {
+  return { projects: {}, unassigned: [] };
 }
 
-async function addEntry(
-  sdk: Caido,
-  requestId: string,
-  host: string,
-  path: string
-): Promise<"added" | "duplicate"> {
-  const entries = getEntries(sdk);
-  if (entries.some((e) => e.requestId === requestId)) return "duplicate";
-  entries.unshift({ requestId, host, path, savedAt: new Date().toISOString() });
-  await saveEntries(sdk, entries);
-  return "added";
+/**
+ * Reads storage defensively: `sdk.storage.get()` throws while the plugin is not
+ * present in the frontend's plugin state, and the stored shape may predate this
+ * version. Never throws, so callers can render unconditionally.
+ */
+function readStore(sdk: Caido): Store {
+  let raw: unknown;
+  try {
+    raw = sdk.storage.get();
+  } catch {
+    return emptyStore();
+  }
+  if (raw === null || typeof raw !== "object") return emptyStore();
+
+  const data = raw as { projects?: unknown; entries?: unknown };
+  const store = emptyStore();
+
+  if (data.projects !== null && typeof data.projects === "object") {
+    for (const [projectId, entries] of Object.entries(data.projects as Record<string, unknown>)) {
+      if (Array.isArray(entries)) store.projects[projectId] = entries.filter(isEntry);
+    }
+  }
+  if (Array.isArray(data.entries)) store.unassigned = data.entries.filter(isEntry);
+
+  return store;
 }
+
+function serializeStore(store: Store): {
+  version: number;
+  projects: Record<string, Entry[]>;
+  entries?: Entry[];
+} {
+  return {
+    version: STORE_VERSION,
+    projects: store.projects,
+    // Keep the legacy key only while it holds something, so an older build of
+    // the plugin still finds those entries.
+    ...(store.unassigned.length > 0 ? { entries: store.unassigned } : {}),
+  };
+}
+
+/**
+ * Serializes read-modify-write cycles. `sdk.storage.set()` resolves once the
+ * mutation has been applied to the frontend's plugin state, so queueing is
+ * enough to stop concurrent writes (e.g. a delete during a bulk save) from
+ * clobbering each other.
+ */
+function createStorage(sdk: Caido) {
+  let queue: Promise<void> = Promise.resolve();
+
+  const mutate = (transform: (store: Store) => Store | undefined): Promise<void> => {
+    const run = async (): Promise<void> => {
+      const next = transform(readStore(sdk));
+      if (next === undefined) return;
+      await sdk.storage.set(serializeStore(next));
+    };
+    // Run regardless of whether the previous write succeeded.
+    queue = queue.then(run, run);
+    return queue;
+  };
+
+  return {
+    entriesFor: (projectId: string | undefined): Entry[] =>
+      projectId === undefined ? [] : (readStore(sdk).projects[projectId] ?? []),
+    mutate,
+  };
+}
+
+type Storage = ReturnType<typeof createStorage>;
+
+function newestFirst(a: Entry, b: Entry): number {
+  return b.savedAt.localeCompare(a.savedAt);
+}
+
+// ─── Editors ──────────────────────────────────────────────────────────────────
+
+type EditorViewLike = {
+  dispatch: (spec: unknown) => void;
+  state: { doc: { length: number } };
+};
+
+type EditorHandle = { getEditorView: () => unknown };
+
+/**
+ * Caido only exposes an editor's CodeMirror view while the element is mounted
+ * (`getEditorView()` returns `undefined` otherwise, and the view is replaced on
+ * every remount). Plugin pages are not kept alive, so leaving the page — which
+ * is what switching projects does — invalidates both editors.
+ *
+ * Writes are therefore best-effort and remembered: whatever could not be
+ * applied is replayed when the page is entered again.
+ */
+function createEditorWriter(editor: EditorHandle) {
+  let pending: string | undefined;
+  let scheduled = false;
+  let attempts = 0;
+
+  const apply = (content: string): boolean => {
+    const view = editor.getEditorView() as EditorViewLike | undefined;
+    if (view === undefined) return false;
+    try {
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content } });
+      return true;
+    } catch {
+      // View was torn down between the lookup and the dispatch.
+      return false;
+    }
+  };
+
+  const tick = (): void => {
+    scheduled = false;
+    if (pending === undefined) return;
+    if (apply(pending)) {
+      pending = undefined;
+      return;
+    }
+    if (attempts > 0) {
+      attempts--;
+      schedule();
+    }
+  };
+
+  const schedule = (): void => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(tick);
+  };
+
+  return {
+    set(content: string): void {
+      if (apply(content)) {
+        pending = undefined;
+        return;
+      }
+      pending = content;
+      attempts = EDITOR_FLUSH_ATTEMPTS;
+      schedule();
+    },
+    /** Called when the page is entered, before the editors have mounted. */
+    retry(): void {
+      if (pending === undefined) return;
+      attempts = EDITOR_FLUSH_ATTEMPTS;
+      schedule();
+    },
+  };
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error(`${label} timed out after ${QUERY_TIMEOUT_MS / 1000}s`));
+    }, QUERY_TIMEOUT_MS);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatSavedAt(savedAt: string): string {
+  const date = new Date(savedAt);
+  if (Number.isNaN(date.getTime())) return savedAt;
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return sameDay ? date.toLocaleTimeString() : date.toLocaleString();
+}
+
+const STYLES = `
+.insp-item { padding:8px 12px; cursor:pointer; display:flex; align-items:flex-start; gap:8px;
+  border-bottom:1px solid var(--c-border-default,#222); background:transparent; }
+.insp-item:hover { background:var(--c-bg-subtle,#1e1e2a); }
+.insp-item[data-active="true"] { background:var(--c-bg-subtle,#2a2a3a); }
+.insp-item__info { flex:1; min-width:0; }
+.insp-item__target { font-size:12px; color:var(--c-fg-default,#ddd);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.insp-item__time { font-size:11px; color:#666; margin-top:2px; }
+.insp-item__remove { background:none; border:none; color:#555; cursor:pointer;
+  font-size:18px; padding:0; line-height:1; flex-shrink:0; }
+.insp-item__remove:hover { color:#ccc; }
+.insp-placeholder { padding:16px 12px; color:#666; font-size:13px; }
+`;
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
-function setEditorContent(editorView: unknown, content: string): void {
-  const view = editorView as {
-    dispatch: (spec: unknown) => void;
-    state: { doc: { length: number } };
-  };
-  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content } });
-}
-
-function buildPage(sdk: Caido): HTMLElement {
+function buildPage(sdk: Caido, storage: Storage) {
   const reqEditor = sdk.ui.httpRequestEditor();
   const respEditor = sdk.ui.httpResponseEditor();
+  const reqWriter = createEditorWriter(reqEditor);
+  const respWriter = createEditorWriter(respEditor);
+
+  let projectId: string | undefined;
   let selectedId: string | null = null;
+  /** Invalidates in-flight loads when the selection or the project changes. */
+  let generation = 0;
 
   // ── Root ────────────────────────────────────────────────────────────────────
   const root = document.createElement("div");
   root.style.cssText = "display:flex;height:100%;overflow:hidden;";
+
+  const styles = document.createElement("style");
+  styles.textContent = STYLES;
+  root.appendChild(styles);
 
   // ── Left panel ──────────────────────────────────────────────────────────────
   const left = document.createElement("div");
@@ -67,12 +277,8 @@ function buildPage(sdk: Caido): HTMLElement {
   toolbarTitle.style.cssText = "font-size:13px;font-weight:600;";
 
   const clearBtn = sdk.ui.button({ variant: "tertiary", label: "Clear All", size: "small" });
-  clearBtn.addEventListener("click", async () => {
-    await saveEntries(sdk, []);
-    selectedId = null;
-    renderList();
-    setEditorContent(reqEditor.getEditorView(), "");
-    setEditorContent(respEditor.getEditorView(), "");
+  clearBtn.addEventListener("click", () => {
+    void clearAll();
   });
 
   toolbar.appendChild(toolbarTitle);
@@ -80,6 +286,19 @@ function buildPage(sdk: Caido): HTMLElement {
 
   const list = document.createElement("div");
   list.style.cssText = "flex:1;overflow-y:auto;";
+  list.addEventListener("click", (event) => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    if (target === null) return;
+    const row = target.closest<HTMLElement>("[data-entry-id]");
+    const requestId = row?.dataset.entryId;
+    if (requestId === undefined) return;
+    if (target.closest("[data-action='remove']") !== null) {
+      event.stopPropagation();
+      void removeEntry(requestId);
+      return;
+    }
+    void loadEntry(requestId);
+  });
 
   left.appendChild(toolbar);
   left.appendChild(list);
@@ -108,152 +327,339 @@ function buildPage(sdk: Caido): HTMLElement {
   root.appendChild(left);
   root.appendChild(right);
 
-  // ── Helpers ──────────────────────────────────────────────────────────────────
+  // ── Rendering ────────────────────────────────────────────────────────────────
+
+  function showPlaceholder(message: string): void {
+    const placeholder = document.createElement("div");
+    placeholder.className = "insp-placeholder";
+    placeholder.textContent = message;
+    list.appendChild(placeholder);
+  }
 
   function renderList(): void {
-    const entries = getEntries(sdk);
     list.innerHTML = "";
 
-    if (entries.length === 0) {
-      const empty = document.createElement("div");
-      empty.textContent = "No saved requests.";
-      empty.style.cssText = "padding:16px 12px;color:#666;font-size:13px;";
-      list.appendChild(empty);
+    if (projectId === undefined) {
+      showPlaceholder("No project selected.");
       return;
     }
 
+    const entries = storage.entriesFor(projectId);
+    if (entries.length === 0) {
+      showPlaceholder("No saved requests in this project.");
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
     for (const entry of entries) {
       const item = document.createElement("div");
-      const active = entry.requestId === selectedId;
-      item.style.cssText = `
-        padding:8px 12px;cursor:pointer;
-        border-bottom:1px solid var(--c-border-default,#222);
-        background:${active ? "var(--c-bg-subtle,#2a2a3a)" : "transparent"};
-        display:flex;align-items:flex-start;gap:8px;
-      `;
-      item.addEventListener("mouseenter", () => {
-        if (!active) item.style.background = "var(--c-bg-subtle,#1e1e2a)";
-      });
-      item.addEventListener("mouseleave", () => {
-        if (!active) item.style.background = "transparent";
-      });
+      item.className = "insp-item";
+      item.dataset.entryId = entry.requestId;
+      if (entry.requestId === selectedId) item.dataset.active = "true";
 
       const info = document.createElement("div");
-      info.style.cssText = "flex:1;min-width:0;";
+      info.className = "insp-item__info";
 
-      const hostPath = document.createElement("div");
-      hostPath.textContent = `${entry.host}${entry.path}`;
-      hostPath.style.cssText =
-        "font-size:12px;color:var(--c-fg-default,#ddd);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      const target = document.createElement("div");
+      target.className = "insp-item__target";
+      target.textContent = `${entry.host}${entry.path}`;
+      target.title = `${entry.host}${entry.path}`;
 
       const time = document.createElement("div");
-      time.textContent = new Date(entry.savedAt).toLocaleTimeString();
-      time.style.cssText = "font-size:11px;color:#666;margin-top:2px;";
+      time.className = "insp-item__time";
+      time.textContent = formatSavedAt(entry.savedAt);
 
-      info.appendChild(hostPath);
+      info.appendChild(target);
       info.appendChild(time);
 
-      const delBtn = document.createElement("button");
-      delBtn.textContent = "×";
-      delBtn.title = "Remove";
-      delBtn.style.cssText =
-        "background:none;border:none;color:#555;cursor:pointer;font-size:18px;padding:0;line-height:1;flex-shrink:0;";
-      delBtn.addEventListener("mouseenter", () => (delBtn.style.color = "#ccc"));
-      delBtn.addEventListener("mouseleave", () => (delBtn.style.color = "#555"));
-      delBtn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const updated = getEntries(sdk).filter((e2) => e2.requestId !== entry.requestId);
-        await saveEntries(sdk, updated);
-        if (selectedId === entry.requestId) {
-          selectedId = null;
-          setEditorContent(reqEditor.getEditorView(), "");
-          setEditorContent(respEditor.getEditorView(), "");
-        }
-        renderList();
-      });
+      const removeBtn = document.createElement("button");
+      removeBtn.className = "insp-item__remove";
+      removeBtn.dataset.action = "remove";
+      removeBtn.textContent = "×";
+      removeBtn.title = "Remove";
 
       item.appendChild(info);
-      item.appendChild(delBtn);
-      item.addEventListener("click", () => loadEntry(entry.requestId));
-      list.appendChild(item);
+      item.appendChild(removeBtn);
+      fragment.appendChild(item);
     }
+    list.appendChild(fragment);
   }
+
+  function clearEditors(): void {
+    reqWriter.set("");
+    respWriter.set("");
+  }
+
+  // ── Actions ──────────────────────────────────────────────────────────────────
 
   async function loadEntry(requestId: string): Promise<void> {
+    const project = projectId;
+    const token = ++generation;
+    const superseded = (): boolean => token !== generation || project !== projectId;
+
     selectedId = requestId;
     renderList();
+    reqWriter.set("Loading…");
+    respWriter.set("");
+
     try {
-      const reqResult = await sdk.graphql.request({ id: requestId });
+      const reqResult = await withTimeout(sdk.graphql.request({ id: requestId }), "Loading request");
+      if (superseded()) return;
+
       const req = reqResult.request;
-      if (!req) {
-        setEditorContent(reqEditor.getEditorView(), "(request no longer available)");
-        setEditorContent(respEditor.getEditorView(), "");
+      if (req === null || req === undefined) {
+        reqWriter.set("(request no longer available in this project)");
+        respWriter.set("");
         return;
       }
-      setEditorContent(reqEditor.getEditorView(), req.raw ?? "");
-      if (req.response?.id) {
-        const respResult = await sdk.graphql.response({ id: req.response.id });
-        setEditorContent(
-          respEditor.getEditorView(),
-          respResult.response?.raw ?? "(no response body)"
-        );
-      } else {
-        setEditorContent(respEditor.getEditorView(), "(no response captured)");
+
+      reqWriter.set(req.raw ?? "");
+
+      const responseId = req.response?.id;
+      if (responseId === undefined) {
+        respWriter.set("(no response captured)");
+        return;
       }
+
+      const respResult = await withTimeout(
+        sdk.graphql.response({ id: responseId }),
+        "Loading response"
+      );
+      if (superseded()) return;
+      respWriter.set(respResult.response?.raw ?? "(no response body)");
     } catch (err) {
-      setEditorContent(reqEditor.getEditorView(), `Error loading request: ${err}`);
+      if (superseded()) return;
+      reqWriter.set(`Error loading request: ${describe(err)}`);
+      respWriter.set("");
     }
   }
 
-  // Re-render the list whenever storage changes (e.g. item added via context menu)
+  async function removeEntry(requestId: string): Promise<void> {
+    const project = projectId;
+    if (project === undefined) return;
+
+    if (selectedId === requestId) {
+      selectedId = null;
+      generation++;
+      clearEditors();
+    }
+
+    try {
+      await storage.mutate((store) => {
+        const entries = store.projects[project];
+        if (entries === undefined) return undefined;
+        return {
+          ...store,
+          projects: {
+            ...store.projects,
+            [project]: entries.filter((e) => e.requestId !== requestId),
+          },
+        };
+      });
+    } catch (err) {
+      sdk.window.showToast(`Inspector: could not remove entry (${describe(err)})`, {
+        variant: "error",
+      });
+    }
+    renderList();
+  }
+
+  async function clearAll(): Promise<void> {
+    const project = projectId;
+    if (project === undefined) return;
+
+    selectedId = null;
+    generation++;
+    clearEditors();
+
+    try {
+      await storage.mutate((store) => {
+        if ((store.projects[project] ?? []).length === 0) return undefined;
+        return { ...store, projects: { ...store.projects, [project]: [] } };
+      });
+    } catch (err) {
+      sdk.window.showToast(`Inspector: could not clear entries (${describe(err)})`, {
+        variant: "error",
+      });
+    }
+    renderList();
+  }
+
+  // Re-render whenever storage changes (e.g. an entry added via context menu).
   sdk.storage.onChange(() => renderList());
 
   renderList();
-  return root;
+
+  return {
+    root,
+    /** Switching projects invalidates the selection, the list and the editors. */
+    setProject(nextProjectId: string | undefined): void {
+      if (nextProjectId === projectId) return;
+      projectId = nextProjectId;
+      selectedId = null;
+      generation++;
+      clearEditors();
+      renderList();
+    },
+    /**
+     * Fires before the page's editors mount, so replay anything that could not
+     * be written while the page was detached.
+     */
+    onEnter(): void {
+      renderList();
+      reqWriter.retry();
+      respWriter.retry();
+    },
+  };
 }
 
 // ─── Command ──────────────────────────────────────────────────────────────────
 
-async function cmdSendToInspector(sdk: Caido, context: CommandContext): Promise<void> {
+type Candidate = { requestId: string; host: string; path: string };
+
+type RequestLike = { host: string; path: string; query?: string };
+
+/** Drafts have no id yet, so there is nothing stable to save. */
+function toCandidate(req: RequestLike & { id?: string }): Candidate | undefined {
+  if (req.id === undefined || req.id === "") return undefined;
+  const query = req.query ?? "";
+  return { requestId: req.id, host: req.host, path: req.path + (query ? `?${query}` : "") };
+}
+
+function candidatesFrom(context: CommandContext): Candidate[] {
+  switch (context.type) {
+    case "RequestRowContext":
+      return context.requests.map(toCandidate).filter((c): c is Candidate => c !== undefined);
+    case "RequestContext": {
+      const req = context.request;
+      const candidate = "id" in req ? toCandidate(req) : undefined;
+      return candidate === undefined ? [] : [candidate];
+    }
+    case "ResponseContext": {
+      const candidate = toCandidate(context.request);
+      return candidate === undefined ? [] : [candidate];
+    }
+    default:
+      return [];
+  }
+}
+
+async function sendToInspector(
+  sdk: Caido,
+  storage: Storage,
+  projectId: string | undefined,
+  context: CommandContext
+): Promise<void> {
+  const candidates = candidatesFrom(context);
+  if (candidates.length === 0) {
+    sdk.window.showToast("Inspector: no saved request in this context.", { variant: "info" });
+    return;
+  }
+  if (projectId === undefined) {
+    sdk.window.showToast("Inspector: select a project first.", { variant: "warning" });
+    return;
+  }
+
+  let added = 0;
+  let duplicates = 0;
+
   try {
-    let added = 0;
-    let dupes = 0;
+    // One read-modify-write for the whole selection, so saving many rows costs
+    // a single mutation and a single re-render.
+    await storage.mutate((store) => {
+      const existing = store.projects[projectId] ?? [];
+      const seen = new Set(existing.map((e) => e.requestId));
+      const savedAt = new Date().toISOString();
+      const fresh: Entry[] = [];
 
-    if (context.type === "RequestRowContext") {
-      for (const r of context.requests) {
-        const path = r.path + (r.query ? `?${r.query}` : "");
-        const result = await addEntry(sdk, r.id, r.host, path);
-        result === "added" ? added++ : dupes++;
+      for (const candidate of candidates) {
+        if (seen.has(candidate.requestId)) {
+          duplicates++;
+          continue;
+        }
+        seen.add(candidate.requestId);
+        fresh.push({ ...candidate, savedAt });
+        added++;
       }
-    } else if (context.type === "RequestContext") {
-      const req = context.request;
-      if (!("id" in req) || !req.id) return;
-      const path = req.path + (req.query ? `?${req.query}` : "");
-      const result = await addEntry(sdk, req.id, req.host, path);
-      result === "added" ? added++ : dupes++;
-    } else if (context.type === "ResponseContext") {
-      const req = context.request;
-      const path = req.path + (req.query ? `?${req.query}` : "");
-      const result = await addEntry(sdk, req.id, req.host, path);
-      result === "added" ? added++ : dupes++;
-    }
 
-    if (added === 0 && dupes > 0) {
-      sdk.window.showToast("Already in Inspector.", { variant: "info" });
-    } else if (added === 1) {
-      sdk.window.showToast("Sent to Inspector!", { variant: "success" });
-    } else if (added > 1) {
-      sdk.window.showToast(`Sent ${added} requests to Inspector!`, { variant: "success" });
-    }
+      if (fresh.length === 0) return undefined;
+      return {
+        ...store,
+        projects: { ...store.projects, [projectId]: [...fresh.reverse(), ...existing] },
+      };
+    });
   } catch (err) {
-    sdk.window.showToast(`Inspector error: ${err}`, { variant: "error" });
+    sdk.window.showToast(`Inspector error: ${describe(err)}`, { variant: "error" });
+    return;
+  }
+
+  if (added === 0 && duplicates > 0) {
+    sdk.window.showToast("Already in Inspector.", { variant: "info" });
+  } else if (added === 1) {
+    sdk.window.showToast("Sent to Inspector!", { variant: "success" });
+  } else if (added > 1) {
+    sdk.window.showToast(`Sent ${added} requests to Inspector!`, { variant: "success" });
   }
 }
 
 // ─── Plugin Entry Point ───────────────────────────────────────────────────────
 
 export function init(sdk: Caido): void {
-  sdk.navigation.addPage("/inspector", { body: buildPage(sdk) });
+  const storage = createStorage(sdk);
+  const page = buildPage(sdk, storage);
+
+  let projectId: string | undefined;
+  let projectKnown = false;
+
+  /**
+   * Entries written before storage was bucketed per project carry no project
+   * information. Attribute them to the first project that becomes current, so
+   * they stay reachable instead of leaking into every project.
+   */
+  const adoptUnassigned = (target: string): void => {
+    void storage
+      .mutate((store) => {
+        if (store.unassigned.length === 0) return undefined;
+        const existing = store.projects[target] ?? [];
+        const seen = new Set(existing.map((e) => e.requestId));
+        const adopted = store.unassigned.filter((e) => !seen.has(e.requestId));
+        return {
+          projects: {
+            ...store.projects,
+            [target]: [...existing, ...adopted].sort(newestFirst),
+          },
+          unassigned: [],
+        };
+      })
+      .catch(() => {
+        // Nothing to do: the entries stay under the legacy key for next time.
+      });
+  };
+
+  const setProject = (nextProjectId: string | undefined): void => {
+    projectKnown = true;
+    projectId = nextProjectId;
+    page.setProject(nextProjectId);
+    if (nextProjectId !== undefined) adoptUnassigned(nextProjectId);
+  };
+
+  sdk.projects.onCurrentProjectChange((event) => setProject(event.projectId));
+
+  // `onCurrentProjectChange` only reports changes, so seed the current project.
+  void (async () => {
+    try {
+      const result = await sdk.graphql.currentProject();
+      // A change event may have landed first; it wins.
+      if (!projectKnown) setProject(result.currentProject?.project.id);
+    } catch {
+      if (!projectKnown) page.setProject(undefined);
+    }
+  })();
+
+  sdk.navigation.addPage("/inspector", {
+    body: page.root,
+    onEnter: () => page.onEnter(),
+  });
 
   sdk.sidebar.registerItem("Inspector", "/inspector", {
     icon: "fas fa-flask",
@@ -261,7 +667,7 @@ export function init(sdk: Caido): void {
 
   sdk.commands.register("send-to-inspector", {
     name: "Send to Inspector",
-    run: (ctx) => cmdSendToInspector(sdk, ctx),
+    run: (ctx) => sendToInspector(sdk, storage, projectId, ctx),
     group: "Inspector",
   });
 
