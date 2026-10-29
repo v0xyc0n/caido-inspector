@@ -2,7 +2,11 @@
 
 Save interesting requests to a persistent list for later review.
 
-<img width="1275" height="557" alt="image" src="https://github.com/user-attachments/assets/874cfc6f-5b4d-4c73-8a16-fd83f4fb9e8b" />
+<img width="1437" height="772" alt="Inspector page with saved requests in collections and the request/response editors" src="docs/screenshot.png" />
+
+Right-click any request and choose **Plugins → Inspector → Send to Inspector** (or press Cmd/Ctrl+Shift+I):
+
+<img width="1127" height="404" alt="Send to Inspector in the request context menu" src="docs/send-to-inspector.png" />
 
 Mostly vibecoded and in daily use by me.
 

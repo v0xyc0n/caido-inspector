@@ -1,14 +1,17 @@
 {
   "name": "inspector",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
+  "packageManager": "pnpm@10.32.1",
   "scripts": {
     "build": "caido-dev build",
     "watch": "caido-dev watch",
-    "dev": "caido-dev dev"
+    "dev": "caido-dev dev",
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p backend"
   },
   "devDependencies": {
-    "@caido-community/dev": "^0.1.6",
+    "@caido-community/dev": "^0.1.7",
+    "@caido/sdk-backend": "0.58.3",
     "@caido/sdk-frontend": "^0.55.3",
     "typescript": "^5.9.3"
   }

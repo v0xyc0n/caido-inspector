@@ -4,8 +4,16 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true,
-    "lib": ["ES2020", "DOM"],
-    "skipLibCheck": true
+    "lib": [
+      "ES2020",
+      "DOM"
+    ],
+    "skipLibCheck": true,
+    "types": [
+      "@caido/sdk-backend"
+    ]
   },
-  "include": ["plugin/src"]
+  "include": [
+    "plugin/src"
+  ]
 }

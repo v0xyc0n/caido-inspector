@@ -3,46 +3,70 @@ on:
   workflow_dispatch:
 jobs:
   release:
+    # Releases are signed with the store key, so only ever build them from main.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Actions are pinned to commit SHAs; the comment names the release each SHA belongs to.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 20
-      - uses: pnpm/action-setup@v4
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          version: 9
-          run_install: true
+          node-version: 26.12.1
+      # Version comes from "packageManager" in package.json.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
 
       - name: Build package
         run: pnpm build
 
       - name: Sign package
         working-directory: dist
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
         run: |
-          if [[ -z "${{ secrets.PRIVATE_KEY }}" ]]; then
+          if [[ -z "$PRIVATE_KEY" ]]; then
             echo "Set an ed25519 key as PRIVATE_KEY in GitHub Actions secrets to sign."
-          else
-            printf '%s' "${{ secrets.PRIVATE_KEY }}" > private_key.pem
-            openssl pkeyutl -sign -inkey private_key.pem -out plugin_package.zip.sig \
-              -rawin -in plugin_package.zip
-            rm private_key.pem
+            exit 0
           fi
+          trap 'rm -f private_key.pem' EXIT
+          printf '%s' "$PRIVATE_KEY" > private_key.pem
+          openssl pkeyutl -sign -inkey private_key.pem -out plugin_package.zip.sig \
+            -rawin -in plugin_package.zip
 
       - name: Check version
         id: meta
         working-directory: dist
         run: |
           VERSION=$(unzip -p plugin_package.zip manifest.json | jq -r .version)
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # The store's Changelog tab shows the release body, so it comes from the
+      # matching CHANGELOG.md section.
+      - name: Extract release notes
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '$0 == "## " v {found=1; next} found && /^## / {exit} found {print}' CHANGELOG.md \
+            | sed '/./,$!d' > release_notes.md
+          if [[ ! -s release_notes.md ]]; then
+            echo "::error::No '## $VERSION' section in CHANGELOG.md"
+            exit 1
+          fi
 
       - name: Create release
-        uses: caido/action-release@v1
+        uses: caido/action-release@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
         with:
           tag: ${{ steps.meta.outputs.version }}
           commit: ${{ github.sha }}
-          body: "Release ${{ steps.meta.outputs.version }}"
+          bodyFile: release_notes.md
           artifacts: "dist/plugin_package.zip,dist/plugin_package.zip.sig"
           immutableCreate: true

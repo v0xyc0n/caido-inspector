@@ -1,0 +1,7 @@
+# Block package versions published in the last 7 days (minutes).
+minimumReleaseAge: 10080
+# Refuse versions that lost provenance compared to earlier releases.
+trustPolicy: no-downgrade
+trustPolicyExclude:
+  # Pinned by @caido-community/dev 0.1.7, published without provenance.
+  - chokidar@4.0.3

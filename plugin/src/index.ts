@@ -1,49 +1,16 @@
-import type { Caido } from "@caido/sdk-frontend";
-import type { CommandContext } from "@caido/sdk-frontend";
+import type { Caido, CommandContext } from "@caido/sdk-frontend";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+import type { API, BackendEvents } from "../../backend/src/index";
+import {
+  type Candidate,
+  type Collection,
+  type Entry,
+  type ProjectData,
+  type Result,
+  emptyProject,
+} from "../../backend/src/model";
 
-type Entry = {
-  requestId: string;
-  host: string;
-  /** Path including the query string, as shown in the list. */
-  path: string;
-  savedAt: string;
-  /** Absent on entries saved before these were recorded. */
-  port?: number;
-  isTls?: boolean;
-  /** Collection the entry sits in; absent means uncategorised. */
-  collectionId?: string;
-};
-
-/** A user-made category, mirroring Replay's collections. */
-type Collection = {
-  id: string;
-  name: string;
-  collapsed?: boolean;
-};
-
-/** Everything saved for one project. */
-type ProjectData = {
-  entries: Entry[];
-  collections: Collection[];
-};
-
-/**
- * Plugin storage is global to the plugin (one row per user+plugin in Caido's
- * `plugins.db`), but request IDs are only meaningful inside the project that
- * produced them. Entries are therefore bucketed per project id.
- *
- * `unassigned` holds entries written by versions that kept a single flat list.
- * They are persisted back under the legacy `entries` key until a project is
- * selected and they can be attributed to one.
- */
-type Store = {
-  projects: Record<string, ProjectData>;
-  unassigned: Entry[];
-};
-
-const STORE_VERSION = 3;
+type FrontendSDK = Caido<API, BackendEvents>;
 
 /** Giving up beats hanging forever when the API connection is down. */
 const QUERY_TIMEOUT_MS = 15_000;
@@ -56,135 +23,26 @@ const FINDING_REPORTER = "Inspector";
 /** Sentinel for the bucket of entries that are in no collection. */
 const UNCATEGORISED = "__none__";
 
-// ─── Storage ──────────────────────────────────────────────────────────────────
-
-function isEntry(value: unknown): value is Entry {
-  if (value === null || typeof value !== "object") return false;
-  const e = value as Partial<Entry>;
-  return (
-    typeof e.requestId === "string" &&
-    typeof e.host === "string" &&
-    typeof e.path === "string" &&
-    typeof e.savedAt === "string"
-  );
-}
-
-function emptyStore(): Store {
-  return { projects: {}, unassigned: [] };
-}
+// ─── Backend ──────────────────────────────────────────────────────────────────
 
 /**
- * Reads storage defensively: `sdk.storage.get()` throws while the plugin is not
- * present in the frontend's plugin state, and the stored shape may predate this
- * version. Never throws, so callers can render unconditionally.
+ * Saved requests are owned by the backend plugin (see backend/src/index.ts).
+ * This wraps a call: an error becomes a toast, the caller gets the value or
+ * `undefined`.
  */
-function readStore(sdk: Caido): Store {
-  let raw: unknown;
+async function call<T>(
+  sdk: FrontendSDK,
+  request: Promise<Result<T>>,
+  failure: string
+): Promise<T | undefined> {
   try {
-    raw = sdk.storage.get();
-  } catch {
-    return emptyStore();
+    const result = await withTimeout(request, failure);
+    if (result.kind === "Ok") return result.value;
+    sdk.window.showToast(`${failure}: ${result.error}`, { variant: "error" });
+  } catch (err) {
+    sdk.window.showToast(`${failure}: ${describe(err)}`, { variant: "error" });
   }
-  if (raw === null || typeof raw !== "object") return emptyStore();
-
-  const data = raw as { projects?: unknown; entries?: unknown };
-  const store = emptyStore();
-
-  if (data.projects !== null && typeof data.projects === "object") {
-    for (const [projectId, value] of Object.entries(data.projects as Record<string, unknown>)) {
-      store.projects[projectId] = toProjectData(value);
-    }
-  }
-  if (Array.isArray(data.entries)) store.unassigned = data.entries.filter(isEntry);
-
-  return store;
-}
-
-function isCollection(value: unknown): value is Collection {
-  if (value === null || typeof value !== "object") return false;
-  const c = value as Partial<Collection>;
-  return typeof c.id === "string" && typeof c.name === "string";
-}
-
-/** Accepts both the v2 shape (a bare entry array) and the v3 shape. */
-function toProjectData(value: unknown): ProjectData {
-  if (Array.isArray(value)) return { entries: value.filter(isEntry), collections: [] };
-  if (value === null || typeof value !== "object") return { entries: [], collections: [] };
-  const data = value as { entries?: unknown; collections?: unknown };
-  return {
-    entries: Array.isArray(data.entries) ? data.entries.filter(isEntry) : [],
-    collections: Array.isArray(data.collections) ? data.collections.filter(isCollection) : [],
-  };
-}
-
-function serializeStore(store: Store): {
-  version: number;
-  projects: Record<string, ProjectData>;
-  entries?: Entry[];
-} {
-  return {
-    version: STORE_VERSION,
-    projects: store.projects,
-    // Keep the legacy key only while it holds something, so an older build of
-    // the plugin still finds those entries.
-    ...(store.unassigned.length > 0 ? { entries: store.unassigned } : {}),
-  };
-}
-
-/**
- * Serializes read-modify-write cycles. `sdk.storage.set()` resolves once the
- * mutation has been applied to the frontend's plugin state, so queueing is
- * enough to stop concurrent writes (e.g. a delete during a bulk save) from
- * clobbering each other.
- */
-function createStorage(sdk: Caido) {
-  let queue: Promise<void> = Promise.resolve();
-
-  const mutate = (transform: (store: Store) => Store | undefined): Promise<void> => {
-    const run = async (): Promise<void> => {
-      const next = transform(readStore(sdk));
-      if (next === undefined) return;
-      await sdk.storage.set(serializeStore(next));
-    };
-    // Run regardless of whether the previous write succeeded.
-    queue = queue.then(run, run);
-    return queue;
-  };
-
-  const dataFor = (projectId: string | undefined): ProjectData =>
-    projectId === undefined
-      ? { entries: [], collections: [] }
-      : (readStore(sdk).projects[projectId] ?? { entries: [], collections: [] });
-
-  return {
-    dataFor,
-    entriesFor: (projectId: string | undefined): Entry[] => dataFor(projectId).entries,
-    collectionsFor: (projectId: string | undefined): Collection[] => dataFor(projectId).collections,
-    /** Applies a change to one project's data, leaving every other project alone. */
-    mutateProject: (
-      projectId: string,
-      transform: (data: ProjectData) => ProjectData | undefined
-    ): Promise<void> =>
-      mutate((store) => {
-        const current = store.projects[projectId] ?? { entries: [], collections: [] };
-        const next = transform(current);
-        if (next === undefined) return undefined;
-        return { ...store, projects: { ...store.projects, [projectId]: next } };
-      }),
-    mutate,
-  };
-}
-
-function newId(): string {
-  const maybeCrypto = globalThis.crypto as { randomUUID?: () => string } | undefined;
-  if (typeof maybeCrypto?.randomUUID === "function") return maybeCrypto.randomUUID();
-  return `c-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
-
-type Storage = ReturnType<typeof createStorage>;
-
-function newestFirst(a: Entry, b: Entry): number {
-  return b.savedAt.localeCompare(a.savedAt);
+  return undefined;
 }
 
 // ─── Editors ──────────────────────────────────────────────────────────────────
@@ -198,27 +56,36 @@ type EditorViewLike = {
   };
 };
 
-type EditorHandle = { getEditorView: () => unknown };
+type EditorHandle = { getElement: () => HTMLElement; getEditorView: () => unknown };
 
 /**
- * Caido only exposes an editor's CodeMirror view while the element is mounted
- * (`getEditorView()` returns `undefined` otherwise, and the view is replaced on
- * every remount). Plugin pages are not kept alive, so leaving the page — which
- * is what switching projects does — invalidates both editors.
+ * Caido's editors are Vue custom elements, and plugin pages are not kept
+ * alive: leaving the page detaches them, entering it again re-attaches them.
+ * Vue (3.5, as shipped with Caido 0.59) only cleans up properly the first
+ * time. From the second re-attach on, the element keeps showing its old view
+ * but loses track of its component, so `getEditorView()` returns `undefined`
+ * for good and every write is lost.
  *
- * Writes are therefore best-effort and remembered: whatever could not be
- * applied is replayed when the page is entered again.
+ * The slot therefore swaps in a brand-new editor each time the page is
+ * entered and replays the last content into it. Writes that hit an editor
+ * that is not mounted yet are retried for a few frames.
  */
-function createEditorWriter(editor: EditorHandle) {
+function createEditorSlot(create: () => EditorHandle) {
+  let editor = create();
+  /** Last content written, so a new editor can show it again. */
+  let content = "";
   let pending: string | undefined;
   let scheduled = false;
   let attempts = 0;
 
-  const apply = (content: string): boolean => {
-    const view = editor.getEditorView() as EditorViewLike | undefined;
-    if (view === undefined) return false;
+  const view = (): EditorViewLike | undefined =>
+    editor.getEditorView() as EditorViewLike | undefined;
+
+  const apply = (text: string): boolean => {
+    const current = view();
+    if (current === undefined) return false;
     try {
-      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content } });
+      current.dispatch({ changes: { from: 0, to: current.state.doc.length, insert: text } });
       return true;
     } catch {
       // View was torn down between the lookup and the dispatch.
@@ -245,32 +112,43 @@ function createEditorWriter(editor: EditorHandle) {
     requestAnimationFrame(tick);
   };
 
+  const defer = (text: string): void => {
+    pending = text;
+    attempts = EDITOR_FLUSH_ATTEMPTS;
+    schedule();
+  };
+
   return {
+    element(): HTMLElement {
+      return editor.getElement();
+    },
     /** Text currently selected in the editor, if it is mounted. */
     selection(): string {
-      const view = editor.getEditorView() as EditorViewLike | undefined;
-      if (view === undefined) return "";
+      const current = view();
+      if (current === undefined) return "";
       try {
-        const { from, to } = view.state.selection.main;
-        return from === to ? "" : view.state.sliceDoc(from, to);
+        const { from, to } = current.state.selection.main;
+        return from === to ? "" : current.state.sliceDoc(from, to);
       } catch {
         return "";
       }
     },
-    set(content: string): void {
-      if (apply(content)) {
+    set(text: string): void {
+      content = text;
+      if (apply(text)) {
         pending = undefined;
         return;
       }
-      pending = content;
-      attempts = EDITOR_FLUSH_ATTEMPTS;
-      schedule();
+      defer(text);
     },
-    /** Called when the page is entered, before the editors have mounted. */
-    retry(): void {
-      if (pending === undefined) return;
-      attempts = EDITOR_FLUSH_ATTEMPTS;
-      schedule();
+    /**
+     * Called when the page is entered, before the editors mount. Returns the
+     * new editor's element, which replaces the old one in the page.
+     */
+    renew(): HTMLElement {
+      editor = create();
+      defer(content);
+      return editor.getElement();
     },
   };
 }
@@ -704,17 +582,17 @@ function openPrompt(
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
-function buildPage(sdk: Caido, storage: Storage) {
+function buildPage(sdk: FrontendSDK) {
   installStyles();
 
-  const reqEditor = sdk.ui.httpRequestEditor();
-  const respEditor = sdk.ui.httpResponseEditor();
-  const reqWriter = createEditorWriter(reqEditor);
-  const respWriter = createEditorWriter(respEditor);
+  const reqWriter = createEditorSlot(() => sdk.ui.httpRequestEditor());
+  const respWriter = createEditorSlot(() => sdk.ui.httpResponseEditor());
   const layer = createFloatingLayer();
 
   let projectId: string | undefined;
-  let selectedId: string | null = null;
+  /** The current project's saved requests, as last returned by the backend. */
+  let data: ProjectData = emptyProject();
+  let selectedId: string | undefined;
   /** Invalidates in-flight loads when the selection or the project changes. */
   let generation = 0;
   /** Where the last menu opened, so the finding prompt can reuse the spot. */
@@ -777,7 +655,7 @@ function buildPage(sdk: Caido, storage: Storage) {
     const target = event.target instanceof HTMLElement ? event.target : null;
     const requestId = target?.closest<HTMLElement>("[data-entry-id]")?.dataset.entryId;
     if (requestId === undefined) return undefined;
-    return storage.entriesFor(projectId).find((e) => e.requestId === requestId);
+    return data.entries.find((e) => e.requestId === requestId);
   };
 
   const dropGroupFromEvent = (event: Event): HTMLElement | undefined => {
@@ -872,7 +750,8 @@ function buildPage(sdk: Caido, storage: Storage) {
     if (group === undefined) return;
     event.preventDefault();
     const transfer = (event as DragEvent).dataTransfer;
-    const requestId = transfer?.getData("text/plain") ?? draggingId;
+    // getData() yields "" rather than undefined when nothing was set.
+    const requestId = transfer?.getData("text/plain") || draggingId;
     draggingId = undefined;
     if (requestId === undefined || requestId === "") return;
     const target = group.dataset.collectionId;
@@ -902,11 +781,15 @@ function buildPage(sdk: Caido, storage: Storage) {
 
   // The SDK editors render their own "Request" / "Response" header, so the pane
   // adds none of its own.
+  const mountEditor = (pane: HTMLElement, editorEl: HTMLElement): void => {
+    editorEl.className = "insp-pane__body";
+    pane.replaceChildren(editorEl);
+  };
+
   const makePane = (which: "request" | "response", editorEl: HTMLElement) => {
     const pane = document.createElement("div");
     pane.className = "insp-pane";
-    editorEl.className = "insp-pane__body";
-    pane.appendChild(editorEl);
+    mountEditor(pane, editorEl);
     pane.addEventListener("contextmenu", (event) => {
       const entry = selectedEntry();
       if (entry === undefined) return; // nothing loaded: leave the default menu alone
@@ -916,8 +799,10 @@ function buildPage(sdk: Caido, storage: Storage) {
     return pane;
   };
 
-  detail.appendChild(makePane("request", reqEditor.getElement()));
-  detail.appendChild(makePane("response", respEditor.getElement()));
+  const reqPane = makePane("request", reqWriter.element());
+  const respPane = makePane("response", respWriter.element());
+  detail.appendChild(reqPane);
+  detail.appendChild(respPane);
 
   root.appendChild(sidebar);
   root.appendChild(detail);
@@ -1064,7 +949,7 @@ function buildPage(sdk: Caido, storage: Storage) {
       return;
     }
 
-    const { entries, collections } = storage.dataFor(projectId);
+    const { entries, collections } = data;
     headerCount.textContent = entries.length === 0 ? "" : String(entries.length);
 
     if (entries.length === 0 && collections.length === 0) {
@@ -1112,8 +997,8 @@ function buildPage(sdk: Caido, storage: Storage) {
   // ── Menus ────────────────────────────────────────────────────────────────────
 
   function selectedEntry(): Entry | undefined {
-    if (selectedId === null) return undefined;
-    return storage.entriesFor(projectId).find((e) => e.requestId === selectedId);
+    if (selectedId === undefined) return undefined;
+    return data.entries.find((e) => e.requestId === selectedId);
   }
 
   /** Actions shared by the row menu and the editor panes. */
@@ -1198,21 +1083,30 @@ function buildPage(sdk: Caido, storage: Storage) {
   // ── Collections ──────────────────────────────────────────────────────────────
 
   function collectionsNow(): Collection[] {
-    return storage.collectionsFor(projectId);
+    return data.collections;
   }
 
-  async function withProject(
-    change: (data: ProjectData) => ProjectData | undefined,
-    failure: string
-  ): Promise<void> {
-    const project = projectId;
-    if (project === undefined) return;
-    try {
-      await storage.mutateProject(project, change);
-    } catch (err) {
-      sdk.window.showToast(`${failure}: ${describe(err)}`, { variant: "error" });
-    }
+  /**
+   * Shows what the backend returned, unless the user switched projects in the
+   * meantime. Other clients pick the change up through `inspector:changed`.
+   */
+  function show(project: string, next: ProjectData): void {
+    if (project !== projectId) return;
+    data = next;
     renderList();
+  }
+
+  /** Runs one backend change on the current project; resolves to success. */
+  async function withProject(
+    change: (project: string) => Promise<Result<ProjectData>>,
+    failure: string
+  ): Promise<boolean> {
+    const project = projectId;
+    if (project === undefined) return false;
+    const next = await call(sdk, change(project), failure);
+    if (next === undefined) return false;
+    show(project, next);
+    return true;
   }
 
   function promptNewCollection(x: number, y: number, moveEntryId?: string): void {
@@ -1220,17 +1114,8 @@ function buildPage(sdk: Caido, storage: Storage) {
       layer,
       { label: "New collection", value: "", confirmLabel: "Create" },
       (name) => {
-        const id = newId();
         void withProject(
-          (data) => ({
-            collections: [...data.collections, { id, name }],
-            entries:
-              moveEntryId === undefined
-                ? data.entries
-                : data.entries.map((e) =>
-                    e.requestId === moveEntryId ? { ...e, collectionId: id } : e
-                  ),
-          }),
+          (project) => sdk.backend.createCollection(project, name, moveEntryId),
           "Could not create the collection"
         );
       },
@@ -1245,10 +1130,7 @@ function buildPage(sdk: Caido, storage: Storage) {
       { label: "Rename collection", value: collection.name, confirmLabel: "Rename" },
       (name) => {
         void withProject(
-          (data) => ({
-            ...data,
-            collections: data.collections.map((c) => (c.id === collection.id ? { ...c, name } : c)),
-          }),
+          (project) => sdk.backend.renameCollection(project, collection.id, name),
           "Could not rename the collection"
         );
       },
@@ -1259,19 +1141,13 @@ function buildPage(sdk: Caido, storage: Storage) {
 
   /** Deleting a collection keeps its requests; they fall back to uncategorised. */
   function deleteCollection(collection: Collection): void {
-    const affected = storage
-      .entriesFor(projectId)
-      .filter((e) => e.collectionId === collection.id).length;
+    const affected = data.entries.filter((e) => e.collectionId === collection.id).length;
 
     void withProject(
-      (data) => ({
-        collections: data.collections.filter((c) => c.id !== collection.id),
-        entries: data.entries.map((e) =>
-          e.collectionId === collection.id ? { ...e, collectionId: undefined } : e
-        ),
-      }),
+      (project) => sdk.backend.deleteCollection(project, collection.id),
       "Could not delete the collection"
-    ).then(() => {
+    ).then((ok) => {
+      if (!ok) return;
       sdk.window.showToast(
         affected === 0
           ? `Collection “${collection.name}” deleted.`
@@ -1283,12 +1159,7 @@ function buildPage(sdk: Caido, storage: Storage) {
 
   function moveEntry(requestId: string, collectionId: string | undefined): void {
     void withProject(
-      (data) => ({
-        ...data,
-        entries: data.entries.map((e) =>
-          e.requestId === requestId ? { ...e, collectionId } : e
-        ),
-      }),
+      (project) => sdk.backend.moveEntry(project, requestId, collectionId),
       "Could not move the request"
     );
   }
@@ -1300,12 +1171,7 @@ function buildPage(sdk: Caido, storage: Storage) {
       return;
     }
     void withProject(
-      (data) => ({
-        ...data,
-        collections: data.collections.map((c) =>
-          c.id === id ? { ...c, collapsed: c.collapsed !== true } : c
-        ),
-      }),
+      (project) => sdk.backend.toggleCollection(project, id),
       "Could not update the collection"
     );
   }
@@ -1569,81 +1435,85 @@ function buildPage(sdk: Caido, storage: Storage) {
   }
 
   async function removeEntry(requestId: string): Promise<void> {
-    const project = projectId;
-    if (project === undefined) return;
-
     if (selectedId === requestId) {
-      selectedId = null;
+      selectedId = undefined;
       generation++;
       clearEditors();
     }
-
-    try {
-      await storage.mutateProject(project, (data) => ({
-        ...data,
-        entries: data.entries.filter((e) => e.requestId !== requestId),
-      }));
-    } catch (err) {
-      sdk.window.showToast(`Inspector: could not remove entry (${describe(err)})`, {
-        variant: "error",
-      });
-    }
-    renderList();
+    await withProject(
+      (project) => sdk.backend.removeEntry(project, requestId),
+      "Inspector: could not remove the request"
+    );
   }
 
   async function clearAll(): Promise<void> {
-    const project = projectId;
-    if (project === undefined) return;
+    const count = data.entries.length;
+    if (projectId === undefined || count === 0) return;
+    const noun = count === 1 ? "request" : "requests";
+    if (!window.confirm(`Remove all ${count} saved ${noun} from this project? This cannot be undone.`)) {
+      return;
+    }
 
-    selectedId = null;
+    selectedId = undefined;
     generation++;
     clearEditors();
-
-    try {
-      await storage.mutateProject(project, (data) =>
-        data.entries.length === 0 ? undefined : { ...data, entries: [] }
-      );
-    } catch (err) {
-      sdk.window.showToast(`Inspector: could not clear entries (${describe(err)})`, {
-        variant: "error",
-      });
-    }
-    renderList();
+    await withProject(
+      (project) => sdk.backend.clearEntries(project),
+      "Inspector: could not clear the saved requests"
+    );
   }
 
-  // Re-render whenever storage changes (e.g. an entry added via context menu).
-  sdk.storage.onChange(() => renderList());
+  /** Reloads the current project's saved requests from the backend. */
+  async function refresh(): Promise<void> {
+    const project = projectId;
+    if (project === undefined) return;
+    const next = await call(
+      sdk,
+      sdk.backend.getProject(project),
+      "Inspector: could not load the saved requests"
+    );
+    if (next !== undefined) show(project, next);
+  }
+
+  // Another client (window, browser tab) or a context-menu save changed a project.
+  sdk.backend.onEvent("inspector:changed", (changed) => {
+    if (changed === projectId) void refresh();
+  });
 
   renderList();
 
   return {
     root,
+    show,
     /** Switching projects invalidates the selection, the list and the editors. */
     setProject(nextProjectId: string | undefined): void {
       if (nextProjectId === projectId) return;
       layer.close();
       projectId = nextProjectId;
-      selectedId = null;
+      data = emptyProject();
+      selectedId = undefined;
       generation++;
       clearEditors();
       renderList();
+      void refresh();
     },
     /**
-     * Fires before the page's editors mount, so replay anything that could not
-     * be written while the page was detached.
+     * Fires before the page is attached again. Swaps in fresh editors (see
+     * `createEditorSlot`), which then get the last content replayed.
      */
     onEnter(): void {
       layer.close();
+      mountEditor(reqPane, reqWriter.renew());
+      mountEditor(respPane, respWriter.renew());
       renderList();
-      reqWriter.retry();
-      respWriter.retry();
+      void refresh();
     },
   };
 }
 
-// ─── Command ──────────────────────────────────────────────────────────────────
+type Page = ReturnType<typeof buildPage>;
 
-type Candidate = Omit<Entry, "savedAt">;
+// ─── Command ──────────────────────────────────────────────────────────────────
 
 type RequestLike = { host: string; path: string; query?: string; port?: number; isTls?: boolean };
 
@@ -1665,7 +1535,7 @@ function toCandidate(req: RequestLike & { id?: string }): Candidate | undefined 
  * with a bare `BaseContext`, so the selection has to be recovered from the
  * global page context instead.
  */
-function selectedIdsFromPage(sdk: Caido): string[] {
+function selectedIdsFromPage(sdk: FrontendSDK): string[] {
   let page;
   try {
     page = sdk.window.getContext().page;
@@ -1686,7 +1556,7 @@ function selectedIdsFromPage(sdk: Caido): string[] {
 }
 
 /** Turns bare ids into entries by fetching the metadata the context lacks. */
-async function candidatesFromIds(sdk: Caido, ids: string[]): Promise<Candidate[]> {
+async function candidatesFromIds(sdk: FrontendSDK, ids: string[]): Promise<Candidate[]> {
   const found = await Promise.all(
     ids.map(async (id) => {
       try {
@@ -1728,8 +1598,8 @@ function candidatesFrom(context: CommandContext): Candidate[] {
 }
 
 async function sendToInspector(
-  sdk: Caido,
-  storage: Storage,
+  sdk: FrontendSDK,
+  page: Page,
   projectId: string | undefined,
   context: CommandContext
 ): Promise<void> {
@@ -1746,86 +1616,38 @@ async function sendToInspector(
     return;
   }
 
-  let added = 0;
-  let duplicates = 0;
+  // One backend call for the whole selection, so saving many rows costs a
+  // single write and a single re-render.
+  const result = await call(
+    sdk,
+    sdk.backend.addEntries(projectId, candidates),
+    "Inspector: could not save"
+  );
+  if (result === undefined) return;
+  page.show(projectId, result.data);
 
-  try {
-    // One read-modify-write for the whole selection, so saving many rows costs
-    // a single mutation and a single re-render.
-    await storage.mutateProject(projectId, (data) => {
-      const seen = new Set(data.entries.map((e) => e.requestId));
-      const savedAt = new Date().toISOString();
-      const fresh: Entry[] = [];
-
-      for (const candidate of candidates) {
-        if (seen.has(candidate.requestId)) {
-          duplicates++;
-          continue;
-        }
-        seen.add(candidate.requestId);
-        fresh.push({ ...candidate, savedAt });
-        added++;
-      }
-
-      if (fresh.length === 0) return undefined;
-      return { ...data, entries: [...fresh.reverse(), ...data.entries] };
-    });
-  } catch (err) {
-    sdk.window.showToast(`Inspector error: ${describe(err)}`, { variant: "error" });
-    return;
-  }
-
-  if (added === 0 && duplicates > 0) {
+  const { added } = result;
+  if (added === 0) {
     sdk.window.showToast("Already in Inspector.", { variant: "info" });
   } else if (added === 1) {
     sdk.window.showToast("Sent to Inspector!", { variant: "success" });
-  } else if (added > 1) {
+  } else {
     sdk.window.showToast(`Sent ${added} requests to Inspector!`, { variant: "success" });
   }
 }
 
 // ─── Plugin Entry Point ───────────────────────────────────────────────────────
 
-export function init(sdk: Caido): void {
-  const storage = createStorage(sdk);
-  const page = buildPage(sdk, storage);
+export function init(sdk: FrontendSDK): void {
+  const page = buildPage(sdk);
 
   let projectId: string | undefined;
   let projectKnown = false;
-
-  /**
-   * Entries written before storage was bucketed per project carry no project
-   * information. Attribute them to the first project that becomes current, so
-   * they stay reachable instead of leaking into every project.
-   */
-  const adoptUnassigned = (target: string): void => {
-    void storage
-      .mutate((store) => {
-        if (store.unassigned.length === 0) return undefined;
-        const current = store.projects[target] ?? { entries: [], collections: [] };
-        const seen = new Set(current.entries.map((e) => e.requestId));
-        const adopted = store.unassigned.filter((e) => !seen.has(e.requestId));
-        return {
-          projects: {
-            ...store.projects,
-            [target]: {
-              ...current,
-              entries: [...current.entries, ...adopted].sort(newestFirst),
-            },
-          },
-          unassigned: [],
-        };
-      })
-      .catch(() => {
-        // Nothing to do: the entries stay under the legacy key for next time.
-      });
-  };
 
   const setProject = (nextProjectId: string | undefined): void => {
     projectKnown = true;
     projectId = nextProjectId;
     page.setProject(nextProjectId);
-    if (nextProjectId !== undefined) adoptUnassigned(nextProjectId);
   };
 
   sdk.projects.onCurrentProjectChange((event) => setProject(event.projectId));
@@ -1852,7 +1674,7 @@ export function init(sdk: Caido): void {
 
   sdk.commands.register("send-to-inspector", {
     name: "Send to Inspector",
-    run: (ctx) => sendToInspector(sdk, storage, projectId, ctx),
+    run: (ctx) => sendToInspector(sdk, page, projectId, ctx),
     group: "Inspector",
   });
 

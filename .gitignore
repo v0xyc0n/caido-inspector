@@ -5,3 +5,4 @@ frontend/
 *.pem
 .DS_Store
 .claude/
+.pnpm-store/
